@@ -1,0 +1,29 @@
+[Unit]
+Description=Reading Manager daily WeRead to Lark sync
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=reading-manager
+Group=reading-manager
+Environment=HOME=/var/lib/reading-manager
+Environment=PATH=/opt/reading-manager/tools/node_modules/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/reading-manager/reading-manager.env
+WorkingDirectory=/opt/reading-manager/current
+ExecStart=/opt/reading-manager/current/.venv/bin/reading-manager run-daily
+TimeoutStartSec=30min
+UMask=0077
+StateDirectory=reading-manager
+StateDirectoryMode=0700
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/reading-manager

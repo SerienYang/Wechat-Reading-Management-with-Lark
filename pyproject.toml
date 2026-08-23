@@ -1,0 +1,16 @@
+[project]
+name = "reading-management-with-lark"
+version = "0.1.0"
+description = "Sync WeRead reading data to Lark Base with optional AI tagging."
+requires-python = ">=3.9"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+reading-manager = "reading_manager.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

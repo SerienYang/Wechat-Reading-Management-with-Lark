@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Reading Manager daily at 23:30 Asia/Shanghai
+
+[Timer]
+OnCalendar=*-*-* 23:30:00 Asia/Shanghai
+Persistent=true
+Unit=reading-manager-daily.service
+
+[Install]
+WantedBy=timers.target

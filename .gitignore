@@ -1,0 +1,50 @@
+# Dependencies
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileconfig
+*storage-state*.json
+*playwright-state*.json
+
+# Logs and runtime output
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.jsonl
+logs/
+data/
+exports/
+.playwright-cli/
+
+# Build and cache output
+dist/
+build/
+*.egg-info/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local workspace files
+.DS_Store
+.idea/
+.vscode/
+.worktrees/
+
+# Temporary project workspace
+tmp/*
+!tmp/.gitkeep
