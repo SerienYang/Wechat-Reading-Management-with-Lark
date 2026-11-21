@@ -1,7 +1,7 @@
 import io
 import os
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from unittest.mock import patch
 
 from reading_manager.cli import (
@@ -13,11 +13,16 @@ from reading_manager.cli import (
     _auth_weread_api_key,
     _compute_daily_reading_stats_from_seconds,
     _finished_shelf_items,
+    _has_reading_evidence_on,
+    _is_recently_read_or_in_progress,
     _find_record_id_with_retry,
     _load_llm_api_key,
     _load_weread_api_key,
     _official_daily_read_seconds,
     _run_daily_job,
+    _select_daily_sync_books,
+    _trusted_last_read_date,
+    _upsert_reading_record_if_missing,
     _tag_note_records,
     _taggable_note_records,
     _upsert_book,
@@ -32,19 +37,29 @@ from reading_manager.weread import BookMetadata, WeReadBook, WeReadProgress, WeR
 
 
 class FakeLark:
-    def __init__(self):
+    def __init__(self, existing_keys=None):
         self.upsert_record_id = None
         self.find_called = False
+        self.upserts = []
+        self.existing_keys = existing_keys or {}
 
     def table_id(self, table_name):
         return f"table-{table_name}"
 
     def upsert_record(self, table_id, fields, record_id=None):
         self.upsert_record_id = record_id
+        self.upserts.append((table_id, fields, record_id))
         return record_id or "rec-new"
 
-    def find_record_id(self, *args, **kwargs):
+    def find_record_id(self, table_id=None, search_field=None, keyword=None, *args, **kwargs):
         self.find_called = True
+        if keyword in self.existing_keys:
+            return self.existing_keys[keyword]
+        # positional compatibility: find_record_id(table, field, keyword)
+        if args and args[-1] in self.existing_keys:
+            return self.existing_keys[args[-1]]
+        if search_field is None and args:
+            pass
         return ""
 
 
@@ -428,6 +443,118 @@ class CliHelperTests(unittest.TestCase):
             WEREAD_KEYCHAIN_ACCOUNT,
             "wrk-test-key",
         )
+
+    def test_select_daily_sync_books_includes_recent_shelf_and_notebooks(self):
+        as_of = date(2026, 11, 21)
+        recent_epoch = int(datetime(2026, 11, 16, 12, 0, 0).timestamp())
+        old_epoch = int(datetime(2022, 3, 23, 12, 0, 0).timestamp())
+        notebooks = [
+            WeReadBook(book_id="nb-old", title="旧笔记书", last_read_time=old_epoch),
+            WeReadBook(book_id="nb-recent", title="新笔记书", last_read_time=recent_epoch),
+        ]
+        shelf = [
+            WeReadShelfItem(
+                metadata=BookMetadata(book_id="shelf-recent", title="示例近期书架书"),
+                progress=WeReadProgress(progress=10, last_read_time=int(datetime(2026, 11, 13, 12, 0, 0).timestamp())),
+                finish_reading=False,
+            ),
+            WeReadShelfItem(
+                metadata=BookMetadata(book_id="shelf-old", title="很久没读"),
+                progress=WeReadProgress(progress=20, last_read_time=int(datetime(2025, 1, 1, 12, 0, 0).timestamp())),
+                finish_reading=False,
+            ),
+            WeReadShelfItem(
+                metadata=BookMetadata(book_id="nb-recent", title="新笔记书"),
+                progress=WeReadProgress(progress=12, last_read_time=recent_epoch),
+                finish_reading=False,
+            ),
+        ]
+
+        result = _select_daily_sync_books(notebooks, shelf, as_of=as_of, limit=20, recent_days=30)
+        titles = [book.title for book in result]
+        self.assertIn("示例近期书架书", titles)
+        self.assertIn("新笔记书", titles)
+        self.assertIn("旧笔记书", titles)
+        self.assertNotIn("很久没读", titles)
+        merged = [book for book in result if book.book_id == "nb-recent"][0]
+        self.assertTrue(merged.from_notebook)
+        self.assertEqual(merged.progress.last_read_time, recent_epoch)
+
+    def test_select_daily_sync_books_never_drops_recent_shelf_when_limit_is_small(self):
+        as_of = date(2026, 11, 21)
+        notebooks = [
+            WeReadBook(book_id=f"nb-{index}", title=f"旧{index}", last_read_time=index)
+            for index in range(1, 8)
+        ]
+        shelf = [
+            WeReadShelfItem(
+                metadata=BookMetadata(book_id="qin", title="示例读完书架书"),
+                progress=WeReadProgress(progress=100, last_read_time=int(datetime(2026, 11, 12, 12, 0, 0).timestamp())),
+                finish_reading=True,
+            )
+        ]
+        result = _select_daily_sync_books(notebooks, shelf, as_of=as_of, limit=3, recent_days=30)
+        ids = [book.book_id for book in result]
+        self.assertIn("qin", ids)
+        self.assertEqual(len(result), 3)
+
+    def test_has_reading_evidence_on_uses_last_read_or_finish_date(self):
+        progress = WeReadProgress(
+            last_read_time=int(datetime(2026, 11, 12, 18, 0, 0).timestamp()),
+            finish_time=int(datetime(2026, 11, 12, 18, 0, 0).timestamp()),
+        )
+        self.assertTrue(_has_reading_evidence_on(progress, date(2026, 11, 12)))
+        self.assertFalse(_has_reading_evidence_on(progress, date(2026, 11, 11)))
+        self.assertFalse(_is_recently_read_or_in_progress(progress, True, date(2026, 10, 1), 30))
+        self.assertTrue(_is_recently_read_or_in_progress(progress, True, date(2026, 11, 21), 30))
+
+    def test_trusted_last_read_prefers_stored_date_when_live_date_is_untrusted(self):
+        live = WeReadProgress(last_read_time=int(datetime(2026, 11, 21, 14, 28, 47).timestamp()))
+        trusted = _trusted_last_read_date(
+            live,
+            existing_book_record={"最近阅读时间": "2026-11-12 00:00:00"},
+            preferred_date=date(2026, 11, 16),
+            untrusted_on=date(2026, 11, 21),
+        )
+        # preferred_date wins when live is untrusted
+        self.assertEqual(trusted, date(2026, 11, 16))
+        trusted_stored = _trusted_last_read_date(
+            live,
+            existing_book_record={"最近阅读时间": "2026-11-12 00:00:00"},
+            preferred_date=None,
+            untrusted_on=date(2026, 11, 21),
+        )
+        self.assertEqual(trusted_stored, date(2026, 11, 12))
+
+    def test_upsert_reading_record_if_missing_does_not_overwrite(self):
+        metadata = BookMetadata(book_id="qin", title="示例读完书")
+        progress = WeReadProgress(progress=100, last_read_time=int(datetime(2026, 11, 12, 12, 0, 0).timestamp()))
+        existing = FakeLark(existing_keys={"daily:qin:2026-11-12": "rec-old"})
+        result = _upsert_reading_record_if_missing(
+            existing,
+            metadata=metadata,
+            progress=progress,
+            book_record_id="rec-book",
+            sync_record_id="rec-sync",
+            record_date="2026-11-12",
+            finish_reading=True,
+        )
+        self.assertEqual(result, "exists")
+        self.assertEqual(existing.upserts, [])
+
+        fresh = FakeLark()
+        result = _upsert_reading_record_if_missing(
+            fresh,
+            metadata=metadata,
+            progress=progress,
+            book_record_id="rec-book",
+            sync_record_id="rec-sync",
+            record_date="2026-11-12",
+            finish_reading=True,
+        )
+        self.assertEqual(result, "created")
+        self.assertEqual(len(fresh.upserts), 1)
+        self.assertEqual(fresh.upserts[0][1]["日级记录键"], "daily:qin:2026-11-12")
 
 def _date(value: str):
     return datetime.strptime(value, "%Y-%m-%d").date()

@@ -9,7 +9,6 @@ from reading_manager.weread import (
     WeReadApiError,
     WeReadClient,
     WeReadGatewayClient,
-    WeReadGatewayUpgradeRequiredError,
     cookie_header,
     cookies_from_playwright_state,
     count_highlights,
@@ -374,7 +373,7 @@ class WereadTests(unittest.TestCase):
 
         self.assertEqual(payload["title"], "示例书籍甲")
         self.assertEqual(captured_bodies[0]["api_name"], "/book/info")
-        self.assertEqual(captured_bodies[0]["skill_version"], "1.0.4")
+        self.assertEqual(captured_bodies[0]["skill_version"], "1.0.6")
         self.assertEqual(captured_bodies[0]["bookId"], "book-1")
         self.assertNotIn("params", captured_bodies[0])
 
@@ -425,8 +424,14 @@ class WereadTests(unittest.TestCase):
         urlopen.return_value = _FakeResponse({"errcode": 0, "upgrade_info": {"version": "next"}})
         client = WeReadGatewayClient("api-key")
 
-        with self.assertRaises(WeReadGatewayUpgradeRequiredError):
-            client.get_shelf()
+        with patch("builtins.print") as mocked_print:
+            shelf = client.get_shelf()
+
+        self.assertEqual(shelf, [])
+        mocked_print.assert_called()
+        warning = mocked_print.call_args[0][0]
+        self.assertIn("WeRead skill upgrade notice", warning)
+        self.assertIn("non-blocking", warning)
 
     @patch("reading_manager.weread.urllib.request.urlopen")
     def test_gateway_reviews_use_official_lowercase_bookid(self, urlopen):
@@ -517,6 +522,30 @@ class WereadTests(unittest.TestCase):
         self.assertEqual(captured_bodies[0]["baseTime"], 1893427200)
         expected_day = datetime.fromtimestamp(1893513600).date().isoformat()
         self.assertEqual(data.daily_read_seconds[expected_day], 1500)
+
+
+
+    def test_parse_shelf_prefers_read_update_time_and_finish_time(self):
+        from reading_manager.weread import parse_shelf_payload
+
+        items = parse_shelf_payload(
+            {
+                "books": [
+                    {
+                        "bookId": "finished-1",
+                        "title": "示例读完书",
+                        "finishReading": 1,
+                        "readUpdateTime": 1794475200,
+                        "updateTime": 1788770000,
+                        "finishTime": 1794475200,
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(items), 1)
+        self.assertTrue(items[0].finish_reading)
+        self.assertEqual(items[0].progress.last_read_time, 1794475200)
+        self.assertEqual(items[0].progress.finish_time, 1794475200)
 
 
 class _FakeHeaders:

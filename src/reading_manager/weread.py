@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import socket
 import urllib.error
 import urllib.parse
@@ -13,7 +14,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 WEREAD_BASE_URL = "https://weread.qq.com"
 WEREAD_COOKIE_DOMAINS = ("weread.qq.com", ".weread.qq.com", "qq.com", ".qq.com")
 WEREAD_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway"
-WEREAD_SKILL_VERSION = "1.0.4"
+WEREAD_SKILL_VERSION = "1.0.6"
 
 
 class WeReadApiError(RuntimeError):
@@ -487,12 +488,16 @@ class WeReadClient:
 
 
 class WeReadGatewayClient:
-    def __init__(self, api_key: str, skill_version: str = WEREAD_SKILL_VERSION):
+    def __init__(self, api_key: str, skill_version: str = ""):
         api_key = str(api_key or "").strip()
         if not api_key:
             raise WeReadApiError("WeRead API key is missing")
         self._api_key = api_key
-        self._skill_version = skill_version
+        self._skill_version = (
+            str(skill_version or "").strip()
+            or os.environ.get("WEREAD_SKILL_VERSION", "").strip()
+            or WEREAD_SKILL_VERSION
+        )
 
     def get_notebooks(self) -> List[WeReadBook]:
         books = []
@@ -570,7 +575,13 @@ class WeReadGatewayClient:
         except json.JSONDecodeError as exc:
             raise WeReadApiError("WeRead gateway response is not valid JSON") from exc
         if isinstance(payload, Mapping) and payload.get("upgrade_info"):
-            raise WeReadGatewayUpgradeRequiredError("WeRead official skill requires an upgrade")
+            info = payload.get("upgrade_info")
+            latest = info.get("latest_version") if isinstance(info, Mapping) else None
+            print(
+                "WeRead skill upgrade notice: "
+                f"current={self._skill_version} latest={latest}. "
+                "Continuing with this response because upgrade_info is non-blocking."
+            )
         _raise_for_weread_error(payload)
         return payload
 
@@ -613,14 +624,20 @@ def _raise_for_weread_error(payload: object) -> None:
 
 
 def _parse_shelf_progress(progress_payload: Mapping[str, object], book_payload: Mapping[str, object]) -> WeReadProgress:
-    last_read_time = _optional_int(progress_payload.get("updateTime"))
+    # Prefer readUpdateTime; book updateTime is often the catalog/metadata time, not last reading.
+    last_read_time = _optional_int(book_payload.get("readUpdateTime"))
     if last_read_time is None:
-        last_read_time = _optional_int(book_payload.get("readUpdateTime") or book_payload.get("updateTime"))
+        last_read_time = _optional_int(progress_payload.get("updateTime") or book_payload.get("updateTime"))
+    finish_time = _optional_int(
+        progress_payload.get("finishTime")
+        or book_payload.get("finishTime")
+        or book_payload.get("finishedTime")
+    )
     return WeReadProgress(
-        progress=_safe_int(progress_payload.get("progress")),
-        reading_minutes=round(_safe_int(progress_payload.get("readingTime")) / 60),
+        progress=_safe_int(progress_payload.get("progress") or book_payload.get("progress")),
+        reading_minutes=round(_safe_int(progress_payload.get("readingTime") or book_payload.get("readingTime")) / 60),
         last_read_time=last_read_time,
-        finish_time=None,
+        finish_time=finish_time,
     )
 
 
