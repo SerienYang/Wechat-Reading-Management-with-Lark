@@ -46,6 +46,7 @@ from .weread import (
     WeReadApiError,
     WeReadClient,
     WeReadGatewayClient,
+    WeReadProgress,
     WeReadShelfItem,
     cookie_header,
     cookies_from_playwright_state,
@@ -206,6 +207,16 @@ def main() -> int:
         help="Upload missing WeRead book covers as Lark Base attachments.",
     )
     covers_parser.add_argument("--limit", type=int, default=0, help="Max book covers to upload, 0 means all.")
+    backfill_parser = subparsers.add_parser(
+        "backfill-recent",
+        help="Add missing books and last-read reading records for recently read shelf books.",
+    )
+    backfill_parser.add_argument("--since", required=True, help="Inclusive ISO date, e.g. 2026-10-01.")
+    backfill_parser.add_argument("--dry-run", action="store_true", help="Print planned writes without changing Lark Base.")
+    backfill_parser.add_argument(
+        "--untrusted-last-read-on",
+        help="If the live shelf last-read falls on this ISO date, prefer an earlier Bitable or known last-read date.",
+    )
 
     subparsers.add_parser(
         "run-daily",
@@ -270,6 +281,8 @@ def _dispatch_command(args) -> int:
         return _retry_tagging(args.limit)
     if args.command == "sync-covers":
         return _sync_covers(args.limit)
+    if args.command == "backfill-recent":
+        return _backfill_recent(args.since, args.dry_run, getattr(args, "untrusted_last_read_on", None))
     if args.command == "run-daily":
         return _run_daily_job()
     if args.command == "install-launchagent":
@@ -556,8 +569,20 @@ def _sync_daily(limit: int, record_date: str = None) -> int:
 
     try:
         client = _weread_client_from_keychain()
-        books = _active_books(client.get_notebooks(), limit)
+        target_date = _parse_iso_date(record_date)
+        is_today = target_date == date.today()
+        # Capture last-read from shelf/notebooks before later book API calls, which can refresh readUpdateTime.
+        notebooks = client.get_notebooks()
+        shelf_items = client.get_shelf()
+        books = _select_daily_sync_books(
+            notebooks,
+            shelf_items,
+            as_of=target_date,
+            limit=limit,
+            recent_days=DEFAULT_CATCHUP_LOOKBACK_DAYS,
+        )
         selected_books = [book.title for book in books]
+        print(_reading_record_scope_message())
         sync_record_id = lark.upsert_record(
             sync_table_id,
             make_sync_fields(
@@ -585,56 +610,75 @@ def _sync_daily(limit: int, record_date: str = None) -> int:
             print("Failed to locate the daily sync record after creating it.")
             return 5
 
-        untagged_records = _taggable_note_records(_list_note_records(lark), limit=limit)
-        retry_stats = _tag_note_records(lark, untagged_records)
-        counts["tags"] += retry_stats.tags_count
-        if retry_stats.failed_notes:
-            errors.append(f"历史未打标笔记重试仍失败 {retry_stats.failed_notes} 条")
+        if is_today:
+            untagged_records = _taggable_note_records(_list_note_records(lark), limit=limit)
+            retry_stats = _tag_note_records(lark, untagged_records)
+            counts["tags"] += retry_stats.tags_count
+            if retry_stats.failed_notes:
+                errors.append(f"历史未打标笔记重试仍失败 {retry_stats.failed_notes} 条")
 
-        note_index = _load_note_index(lark)
+        note_index = _load_note_index(lark) if is_today else {"by_note_id": {}, "by_hash": {}}
         book_index = _load_book_index(lark)
         new_or_changed_records = []
         for book in books:
-            book_payload = client.get_book(book.book_id)
-            progress_payload = client.get_progress(book.book_id)
-            bookmarks_payload = client.get_bookmarks(book.book_id)
-            reviews_payload = client.get_reviews(book.book_id)
-            metadata = parse_book_metadata(book_payload if isinstance(book_payload, dict) else {})
-            if not metadata.title:
-                metadata = parse_book_metadata(
-                    {
-                        "bookId": book.book_id,
-                        "title": book.title,
-                        "author": book.author,
-                        "cover": book.cover,
-                    }
-                )
-            progress = parse_progress_payload(progress_payload)
             now = _now_lark_datetime()
-            book_record_id = _upsert_book(lark, metadata, progress, now, book_index=book_index)
+            metadata = book.metadata
+            # Evidence is taken from the pre-captured last-read/finish times, not from later API calls.
+            captured_progress = book.progress
+            should_write_reading = _has_reading_evidence_on(captured_progress, target_date)
+            should_fetch_notes = is_today and book.from_notebook
+            progress = _effective_progress(captured_progress, book.finish_reading)
+            if is_today and should_fetch_notes:
+                book_payload = client.get_book(book.book_id)
+                progress_payload = client.get_progress(book.book_id)
+                bookmarks_payload = client.get_bookmarks(book.book_id)
+                reviews_payload = client.get_reviews(book.book_id)
+                fetched_metadata = parse_book_metadata(book_payload if isinstance(book_payload, dict) else {})
+                if fetched_metadata.title:
+                    metadata = fetched_metadata
+                fetched_progress = parse_progress_payload(progress_payload)
+                # Keep captured last-read evidence; only enrich progress percent / finish_time when useful.
+                progress = WeReadProgress(
+                    progress=fetched_progress.progress or progress.progress,
+                    reading_minutes=fetched_progress.reading_minutes or progress.reading_minutes,
+                    last_read_time=captured_progress.last_read_time or fetched_progress.last_read_time,
+                    finish_time=fetched_progress.finish_time or captured_progress.finish_time,
+                )
+                progress = _effective_progress(progress, book.finish_reading)
+            elif not metadata.title:
+                continue
+
+            book_record_id = _upsert_book(
+                lark,
+                metadata,
+                progress,
+                now,
+                reading_status=_reading_status(progress, book.finish_reading),
+                book_index=book_index,
+            )
             counts["books"] += 1
 
-            progress_key = daily_record_key(metadata.book_id, record_date)
-            existing_progress_record_id = lark.find_record_id(
-                lark.table_id("阅读记录"),
-                search_field="日级记录键",
-                keyword=progress_key,
-            )
-            lark.upsert_record(
-                lark.table_id("阅读记录"),
-                make_progress_fields(
-                    title=metadata.title,
-                    book_id=metadata.book_id,
+            if should_write_reading:
+                written = _upsert_reading_record_if_missing(
+                    lark,
+                    metadata=metadata,
+                    progress=progress,
                     book_record_id=book_record_id,
                     sync_record_id=sync_record_id,
-                    progress=progress,
-                    now=now,
                     record_date=record_date,
-                    daily_key=progress_key,
-                ),
-                record_id=existing_progress_record_id or None,
-            )
-            counts["reading"] += 1
+                    finish_reading=book.finish_reading,
+                    now=now,
+                )
+                if written == "created":
+                    counts["reading"] += 1
+            elif is_today:
+                print(
+                    f"Skip 阅读记录 for {metadata.title} on {record_date}: "
+                    "no last-read/finish evidence for this date."
+                )
+
+            if not should_fetch_notes:
+                continue
 
             for highlight in _parse_note_payloads(bookmarks_payload, reviews_payload):
                 fields = make_highlight_fields(
@@ -832,16 +876,35 @@ def _sync_finished_books(limit: int = 0) -> int:
             return 5
 
         book_index = _load_book_index(lark)
+        print(_reading_record_scope_message())
         for item in finished_items:
-            _upsert_book(
+            now = _now_lark_datetime()
+            progress = _effective_progress(item.progress, True)
+            book_record_id = _upsert_book(
                 lark,
                 item.metadata,
-                item.progress,
-                _now_lark_datetime(),
+                progress,
+                now,
                 reading_status="读完",
                 book_index=book_index,
             )
             counts["books"] += 1
+            finish_date = _epoch_to_date(progress.finish_time) or _epoch_to_date(progress.last_read_time)
+            if finish_date:
+                written = _upsert_reading_record_if_missing(
+                    lark,
+                    metadata=item.metadata,
+                    progress=progress,
+                    book_record_id=book_record_id,
+                    sync_record_id=sync_record_id,
+                    record_date=finish_date.isoformat(),
+                    finish_reading=True,
+                    now=now,
+                )
+                if written == "created":
+                    counts["reading"] += 1
+            else:
+                print(f"Skip 阅读记录 for finished book {item.metadata.title}: no finish or last-read date.")
 
         _finish_sync_record(
             lark,
@@ -873,6 +936,186 @@ def _sync_finished_books(limit: int = 0) -> int:
         _notify_sync_failure(batch_id, error_summary)
         print(f"Finished WeRead books sync failed: {error_summary}")
         return 9
+
+
+def _backfill_recent(since: str, dry_run: bool = False, untrusted_last_read_on: str = None, known_last_reads: dict = None) -> int:
+    """Add missing 书籍 and last-read 阅读记录 for books read since the given date.
+
+    Existing 阅读记录 rows are never overwritten. Live shelf last-read timestamps that fall
+    on untrusted_last_read_on are replaced with an earlier Bitable or known last-read date
+    when available, and skipped (with a warning) when not.
+    """
+    since_date = _parse_iso_date(since)
+    untrusted = _parse_iso_date(untrusted_last_read_on) if untrusted_last_read_on else None
+    known_last_reads = known_last_reads or {}
+    started_at = _now_lark_datetime()
+    batch_id = "weread-backfill-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    lark = LarkBaseClient()
+    client = _weread_client_from_keychain()
+    # Match the verified backfill order: touch notebooks before reading the shelf.
+    client.get_notebooks()
+    shelf_items = client.get_shelf()
+    print(_reading_record_scope_message())
+
+    book_index = _load_book_index(lark)
+    book_records = {
+        str(record.get("微信读书 Book ID") or ""): record
+        for record in lark.list_records(
+            lark.table_id("书籍"),
+            ["书名", "微信读书 Book ID", "最近阅读时间"],
+        )
+        if record.get("微信读书 Book ID")
+    }
+
+    planned = []
+    skipped = []
+    for item in shelf_items:
+        if not isinstance(item, WeReadShelfItem) or not item.metadata.book_id:
+            continue
+        existing = book_records.get(item.metadata.book_id)
+        preferred = None
+        title = item.metadata.title
+        for key, value in known_last_reads.items():
+            if key == title or key in title or title in key:
+                preferred = value if isinstance(value, date) else _parse_iso_date(str(value))
+                break
+        trusted = _trusted_last_read_date(
+            item.progress,
+            existing_book_record=existing,
+            preferred_date=preferred,
+            untrusted_on=untrusted,
+        )
+        finish_date = _epoch_to_date(item.progress.finish_time)
+        evidence_dates = []
+        if trusted and trusted >= since_date:
+            evidence_dates.append(trusted)
+        if finish_date and finish_date >= since_date and finish_date not in evidence_dates:
+            evidence_dates.append(finish_date)
+        if not evidence_dates:
+            live = _epoch_to_date(item.progress.last_read_time)
+            if live and untrusted is not None and live == untrusted and not trusted:
+                skipped.append(
+                    {
+                        "title": title,
+                        "reason": f"live last-read is {live.isoformat()} which is untrusted and no earlier date is available",
+                    }
+                )
+            continue
+        planned.append(
+            {
+                "title": title,
+                "book_id": item.metadata.book_id,
+                "item": item,
+                "trusted": trusted,
+                "evidence_dates": evidence_dates,
+                "book_exists": bool(existing or book_index.get(item.metadata.book_id)),
+                "finish_reading": item.finish_reading,
+            }
+        )
+
+    print(
+        f"Backfill since {since_date.isoformat()}: {len(planned)} books with evidence, "
+        f"{len(skipped)} skipped for untrusted last-read."
+    )
+    for row in skipped:
+        print(f"  skip {row['title']}: {row['reason']}")
+
+    if dry_run:
+        for row in planned:
+            book_action = "keep 书籍" if row["book_exists"] else "create 书籍"
+            print(
+                f"  {row['title']}: {book_action}; 阅读记录 dates="
+                + ", ".join(d.isoformat() for d in row["evidence_dates"])
+                + f"; finished={row['finish_reading']}"
+            )
+        return 0
+
+    sync_table_id = lark.table_id("同步记录")
+    sync_record_id = lark.upsert_record(
+        sync_table_id,
+        make_sync_fields(
+            batch_id=batch_id,
+            status="运行中",
+            scope=f"补齐 {since_date.isoformat()} 起阅读书籍与末次阅读记录",
+            selected_books=[row["title"] for row in planned],
+            started_at=started_at,
+            ended_at=None,
+            books_count=0,
+            reading_records_count=0,
+            highlights_count=0,
+            tags_count=0,
+            error_summary="",
+        ),
+    )
+    if not sync_record_id:
+        sync_record_id = _find_record_id_with_retry(
+            lark,
+            sync_table_id,
+            "同步批次 ID",
+            batch_id,
+        )
+    if not sync_record_id:
+        print("Failed to locate the backfill sync record after creating it.")
+        return 5
+    counts = {"books": 0, "reading": 0, "highlights": 0, "tags": 0}
+    errors = []
+    now = _now_lark_datetime()
+    for row in planned:
+        item = row["item"]
+        try:
+            progress = item.progress
+            if row["trusted"] is not None:
+                progress = _progress_with_trusted_last_read(progress, item.finish_reading, row["trusted"])
+            progress = _effective_progress(progress, item.finish_reading)
+            existed = bool(book_index.get(item.metadata.book_id))
+            book_record_id = _upsert_book(
+                lark,
+                item.metadata,
+                progress,
+                now,
+                reading_status=_reading_status(progress, item.finish_reading),
+                book_index=book_index,
+            )
+            if not existed:
+                counts["books"] += 1
+            for evidence_date in row["evidence_dates"]:
+                written = _upsert_reading_record_if_missing(
+                    lark,
+                    metadata=item.metadata,
+                    progress=progress,
+                    book_record_id=book_record_id,
+                    sync_record_id=sync_record_id or "",
+                    record_date=evidence_date.isoformat(),
+                    finish_reading=item.finish_reading,
+                    now=now,
+                )
+                if written == "created":
+                    counts["reading"] += 1
+                    print(f"  created 阅读记录 {item.metadata.title} / {evidence_date.isoformat()}")
+                else:
+                    print(f"  kept existing 阅读记录 {item.metadata.title} / {evidence_date.isoformat()}")
+        except (WeReadApiError, LarkBaseError) as exc:
+            errors.append(f"{item.metadata.title}: {exc}")
+            print(f"  failed {item.metadata.title}: {type(exc).__name__}")
+
+    status = "部分成功" if errors else "成功"
+    if sync_record_id:
+        _finish_sync_record(
+            lark,
+            sync_record_id,
+            batch_id=batch_id,
+            status=status,
+            scope=f"补齐 {since_date.isoformat()} 起阅读书籍与末次阅读记录",
+            selected_books=[row["title"] for row in planned],
+            started_at=started_at,
+            counts=counts,
+            error_summary="；".join(str(item) for item in errors)[:500],
+        )
+    print(
+        f"Backfill completed: new_books={counts['books']}, new_reading_records={counts['reading']}, "
+        f"status={status}, batch_id={batch_id}"
+    )
+    return 0 if not errors else 8
 
 
 def _existing_daily_record_dates(lark: LarkBaseClient) -> set:
@@ -1174,6 +1417,214 @@ def _tag_note_records_once(lark: LarkBaseClient, note_records: list):
         failed_record_ids,
         current_tag_record_ids,
     )
+
+
+@dataclass
+class DailySyncBook:
+    """A book considered for daily/catchup sync, with last-read captured before later API calls."""
+
+    book_id: str
+    title: str
+    metadata: BookMetadata
+    progress: WeReadProgress
+    finish_reading: bool = False
+    from_notebook: bool = False
+    notebook: object = None
+
+
+def _epoch_to_date(value):
+    if value is None:
+        return None
+    try:
+        timestamp = int(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp <= 0:
+        return None
+    if timestamp > 10 ** 12:
+        timestamp = int(timestamp / 1000)
+    try:
+        return datetime.fromtimestamp(timestamp).date()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _has_reading_evidence_on(progress, record_date: date, per_book_days=None) -> bool:
+    """Return True if we have evidence the book was read on record_date.
+
+    The official WeRead gateway does not currently expose per-book daily history,
+    so the default evidence is the last-read date and, if present, the finish date.
+    """
+    if per_book_days is not None:
+        return record_date in per_book_days or record_date.isoformat() in per_book_days
+    last_read = _epoch_to_date(progress.last_read_time)
+    finish = _epoch_to_date(progress.finish_time)
+    return last_read == record_date or finish == record_date
+
+
+def _is_recently_read_or_in_progress(progress, finish_reading: bool, as_of: date, recent_days: int) -> bool:
+    if recent_days <= 0:
+        recent_days = DEFAULT_CATCHUP_LOOKBACK_DAYS
+    window_start = as_of - timedelta(days=recent_days - 1)
+    for event in (_epoch_to_date(progress.last_read_time), _epoch_to_date(progress.finish_time)):
+        if event and window_start <= event <= as_of:
+            return True
+    return False
+
+
+def _effective_progress(progress, finish_reading: bool = False):
+    if not finish_reading:
+        return progress
+    if progress.progress >= 95 or progress.finish_time:
+        return progress
+    return WeReadProgress(
+        progress=100,
+        reading_minutes=progress.reading_minutes,
+        last_read_time=progress.last_read_time,
+        finish_time=progress.finish_time or progress.last_read_time,
+    )
+
+
+def _progress_with_trusted_last_read(progress, finish_reading: bool, trusted_last_read: date):
+    trusted_epoch = int(
+        datetime(trusted_last_read.year, trusted_last_read.month, trusted_last_read.day, 12, 0, 0).timestamp()
+    )
+    adjusted = WeReadProgress(
+        progress=progress.progress,
+        reading_minutes=progress.reading_minutes,
+        last_read_time=trusted_epoch,
+        finish_time=progress.finish_time or (trusted_epoch if finish_reading else None),
+    )
+    return _effective_progress(adjusted, finish_reading)
+
+
+def _select_daily_sync_books(notebooks: list, shelf_items: list, as_of: date, limit: int, recent_days: int = DEFAULT_CATCHUP_LOOKBACK_DAYS) -> list:
+    """Notebooks plus shelf books that were recently read or are still in progress."""
+    selected = {}
+    for item in shelf_items or []:
+        if not isinstance(item, WeReadShelfItem):
+            continue
+        book_id = item.metadata.book_id
+        if not book_id:
+            continue
+        if not _is_recently_read_or_in_progress(item.progress, item.finish_reading, as_of, recent_days):
+            continue
+        selected[book_id] = DailySyncBook(
+            book_id=book_id,
+            title=item.metadata.title,
+            metadata=item.metadata,
+            progress=item.progress,
+            finish_reading=item.finish_reading,
+            from_notebook=False,
+        )
+
+    for book in notebooks or []:
+        book_id = getattr(book, "book_id", "")
+        if not book_id:
+            continue
+        if book_id in selected:
+            selected[book_id].from_notebook = True
+            selected[book_id].notebook = book
+            continue
+        notebook_progress = WeReadProgress(last_read_time=getattr(book, "last_read_time", 0) or None)
+        selected[book_id] = DailySyncBook(
+            book_id=book_id,
+            title=book.title,
+            metadata=BookMetadata(
+                book_id=book.book_id,
+                title=book.title,
+                author=getattr(book, "author", ""),
+                cover=getattr(book, "cover", ""),
+            ),
+            progress=notebook_progress,
+            finish_reading=False,
+            from_notebook=True,
+            notebook=book,
+        )
+
+    recent_ids = [
+        book.book_id
+        for book in selected.values()
+        if _is_recently_read_or_in_progress(book.progress, book.finish_reading, as_of, recent_days)
+    ]
+    older_notebook_ids = [
+        book_id
+        for book_id, book in selected.items()
+        if book.from_notebook and book_id not in set(recent_ids)
+    ]
+    older_notebook_ids = sorted(
+        older_notebook_ids,
+        key=lambda book_id: selected[book_id].progress.last_read_time or 0,
+        reverse=True,
+    )
+    if limit > 0:
+        # Never drop recently read/in-progress shelf books; cap only older notebooks.
+        kept_old = older_notebook_ids[: max(0, limit - len(recent_ids))]
+        keep = set(recent_ids) | set(kept_old)
+        selected = {book_id: book for book_id, book in selected.items() if book_id in keep}
+
+    return sorted(
+        selected.values(),
+        key=lambda book: book.progress.last_read_time or 0,
+        reverse=True,
+    )
+
+
+def _reading_record_scope_message() -> str:
+    return (
+        "Reading-record evidence uses last-read/finish dates only; "
+        "WeRead gateway did not provide per-book daily history."
+    )
+
+
+def _trusted_last_read_date(progress, existing_book_record=None, preferred_date=None, untrusted_on=None):
+    """Prefer a previously stored or audited last-read date when the live shelf timestamp is untrusted."""
+    live = _epoch_to_date(progress.last_read_time)
+    stored = None
+    if existing_book_record:
+        stored = _date_from_lark_value(existing_book_record.get("最近阅读时间"))
+    if preferred_date is not None and live == untrusted_on:
+        return preferred_date
+    if stored is not None and untrusted_on is not None and live == untrusted_on:
+        return stored
+    if preferred_date is not None and (live is None or (untrusted_on is not None and live == untrusted_on)):
+        return preferred_date
+    return live
+
+
+def _upsert_reading_record_if_missing(
+    lark,
+    *,
+    metadata,
+    progress,
+    book_record_id: str,
+    sync_record_id: str,
+    record_date: str,
+    finish_reading: bool = False,
+    now: str = None,
+) -> str:
+    """Create a daily 阅读记录 when none exists. Never overwrites an existing row."""
+    now = now or _now_lark_datetime()
+    effective = _effective_progress(progress, finish_reading)
+    progress_key = daily_record_key(metadata.book_id, record_date)
+    table_id = lark.table_id("阅读记录")
+    existing = lark.find_record_id(table_id, search_field="日级记录键", keyword=progress_key)
+    if existing:
+        return "exists"
+    lark.upsert_record(
+        table_id,
+        make_progress_fields(
+            title=metadata.title,
+            book_id=metadata.book_id,
+            book_record_id=book_record_id,
+            sync_record_id=sync_record_id,
+            progress=effective,
+            now=now,
+            record_date=record_date,
+            daily_key=progress_key,
+        ),
+    )
+    return "created"
 
 
 def _active_books(books: list, limit: int) -> list:
@@ -1528,10 +1979,10 @@ def _now_lark_datetime() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _reading_status(progress) -> str:
-    if progress.finish_time or progress.progress >= 95:
+def _reading_status(progress, finish_reading: bool = False) -> str:
+    if finish_reading or progress.finish_time or progress.progress >= 95:
         return "读完"
-    if progress.progress > 0:
+    if progress.progress > 0 or progress.last_read_time:
         return "在读"
     return "未知"
 

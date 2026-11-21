@@ -411,7 +411,7 @@ def make_progress_fields(
             "阅读时长": progress.reading_minutes,
             "最近阅读时间": epoch_to_lark_datetime(progress.last_read_time),
             "读完时间": epoch_to_lark_datetime(progress.finish_time),
-            "同步批次": link_value(sync_record_id),
+            "同步批次": link_value(sync_record_id) if sync_record_id else None,
             "同步时间": now,
         }
     )
